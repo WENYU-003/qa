@@ -1,11 +1,12 @@
+# analysis/visualize_clusters.py
+# Prettier + more "compact" UMAP plot for HDBSCAN clusters
 from pathlib import Path
 import pickle
-import json
 
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Optional: UMAP (recommended). If not installed, fallback to TSNE.
+# Optional: UMAP (recommended). If not installed, fallback to t-SNE.
 try:
     import umap
     HAS_UMAP = True
@@ -18,7 +19,9 @@ from sklearn.manifold import TSNE
 def load_cluster_data(cluster_dir: Path):
     pkl_path = cluster_dir / "cluster_data.pkl"
     if not pkl_path.exists():
-        raise FileNotFoundError(f"Not found: {pkl_path}. Run `python example.py` to generate it.")
+        raise FileNotFoundError(
+            f"Not found: {pkl_path}. Run `python example.py` to generate it."
+        )
 
     with open(pkl_path, "rb") as f:
         data = pickle.load(f)
@@ -28,91 +31,98 @@ def load_cluster_data(cluster_dir: Path):
     return embeddings, labels
 
 
-def load_cluster_name_map(cluster_dir: Path):
-    """
-    Load cluster id -> human-friendly name from clusters.json
-    Returns {} if file missing.
-    """
-    json_path = cluster_dir / "clusters.json"
-    if not json_path.exists():
-        return {}
-
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    name_map = {}
-    for c in data.get("clusters", []):
-        try:
-            cid = int(c.get("id"))
-        except Exception:
-            continue
-        name_map[cid] = c.get("name", f"cluster {cid}")
-    return name_map
-
-
 def reduce_to_2d(X: np.ndarray):
+    """
+    Make the plot less 'spread out' / less 'empty' by:
+    - using smaller min_dist (tighter clusters)
+    - moderate n_neighbors (keep local structure)
+    """
     if HAS_UMAP:
-        reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, random_state=42)
+        reducer = umap.UMAP(
+            n_neighbors=10,     # smaller -> more local, often looks tighter
+            min_dist=0.02,      # smaller -> clusters look more compact
+            spread=0.9,         # slightly lower spread can reduce emptiness
+            metric="cosine",    # embeddings often work better with cosine
+            random_state=42
+        )
         Z = reducer.fit_transform(X)
         method = "UMAP"
     else:
-        reducer = TSNE(n_components=2, perplexity=30, random_state=42, init="pca")
+        # t-SNE typically looks compact by default
+        reducer = TSNE(
+            n_components=2,
+            perplexity=min(30, max(5, (len(X) - 1) // 3)),
+            random_state=42,
+            init="pca",
+            learning_rate="auto"
+        )
         Z = reducer.fit_transform(X)
         method = "t-SNE"
     return Z, method
 
 
 def main():
-    root = Path(__file__).resolve().parents[1]      # qa_github/
+    root = Path(__file__).resolve().parents[1]     # qa_github/
     cluster_dir = root / "data" / "clusters"
 
     X, labels = load_cluster_data(cluster_dir)
-    name_map = load_cluster_name_map(cluster_dir)
-
     Z, method = reduce_to_2d(X)
 
-    # Plot
-    plt.figure(figsize=(9, 7))
+    # ---- Pretty plotting ----
+    plt.figure(figsize=(9, 6))
 
-    # noise first
-    noise = labels == -1
-    if noise.any():
-        plt.scatter(Z[noise, 0], Z[noise, 1], s=10, alpha=0.30, label="noise (-1)")
+    noise_mask = labels == -1
+    cluster_ids = [cid for cid in np.unique(labels) if cid != -1]
+    k = len(cluster_ids)
 
-    # clusters
-    for cid in np.unique(labels):
-        if cid == -1:
-            continue
+    # 1) Draw noise in background (light, transparent)
+    if noise_mask.any():
+        plt.scatter(
+            Z[noise_mask, 0], Z[noise_mask, 1],
+            s=14, alpha=0.12, c="#9aa0a6", linewidths=0, label="noise"
+        )
+
+    # 2) Categorical colormap for clusters
+    cmap = plt.get_cmap("tab20" if k <= 20 else "nipy_spectral")
+
+    # 3) Draw clusters (no per-cluster legend; it destroys aesthetics)
+    for i, cid in enumerate(cluster_ids):
         idx = labels == cid
-        plt.scatter(Z[idx, 0], Z[idx, 1], s=14, alpha=0.70, label=f"cluster {cid}")
+        color = cmap(i % cmap.N)
 
-        # centroid label: "id: name"
+        plt.scatter(
+            Z[idx, 0], Z[idx, 1],
+            s=28, alpha=0.82, c=[color], linewidths=0
+        )
+
+        # 4) Mark cluster "center" (mean of 2D projection) + label
         cx, cy = Z[idx, 0].mean(), Z[idx, 1].mean()
-        cname = name_map.get(int(cid), f"cluster {cid}")
-        label = f"{cid}: {cname}"
-
-        # 把 label 放到簇下方：根据图的y轴范围算一个“相对偏移”，不同数据尺度也稳
-        y_span = float(Z[:, 1].max() - Z[:, 1].min() + 1e-9)
-        dy = 0.04 * y_span   # 4% 的纵向跨度，你想更远就 0.06/0.08
-        label_x = cx
-        label_y = cy - dy
-
+        plt.scatter(
+            cx, cy,
+            s=160, marker="X", c=[color],
+            edgecolors="black", linewidths=0.7, zorder=10
+        )
         plt.text(
-            label_x, label_y, label,
-            fontsize=8, weight="bold",
-            ha="center", va="top",
-            bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.75, linewidth=0),
-            zorder=5)
+            cx, cy, str(cid),
+            fontsize=10, weight="bold",
+            ha="center", va="center", zorder=11
+        )
 
+    # 5) Styling: remove axes for clean look
+    plt.title(f"{method} visualization of HDBSCAN clusters", fontsize=14)
+    plt.xticks([])
+    plt.yticks([])
+    for spine in plt.gca().spines.values():
+        spine.set_visible(False)
 
-    plt.title(f"{method} visualization of HDBSCAN clusters")
+    # Small legend only for noise (optional)
+    if noise_mask.any():
+        plt.legend(loc="upper left", frameon=False)
+
     plt.tight_layout()
 
-    # If legend gets too crowded, you can comment this out
-    plt.legend(markerscale=1.5, fontsize=8, ncol=2)
-
-    out_png = cluster_dir / f"cluster_{method.lower()}.png"
-    plt.savefig(out_png, dpi=220)
+    out_png = cluster_dir / f"cluster_{method.lower()}_pretty.png"
+    plt.savefig(out_png, dpi=320, bbox_inches="tight")
     print(f"Saved plot to: {out_png}")
 
 
